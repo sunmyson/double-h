@@ -1,4 +1,5 @@
-from transformers import pipeline
+from transformers import pipeline;
+import sounddevice as sd;
 
 # 1. Load a free, lightweight summarization model
 summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
@@ -30,3 +31,7 @@ if __name__ == "__main__":
     output_string = summarize_text(input_string)
     print("===== Summary =====")
     print(output_string)
+
+print(sd.query_devices())  # List all input/output devices
+print("Default input:", sd.default.device)
+
