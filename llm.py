@@ -1,37 +1,20 @@
-from transformers import pipeline;
-import sounddevice as sd;
+import httpx
 
-# 1. Load a free, lightweight summarization model
-summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+def prompt_ollama_generate(prompt: str,
+                           model: str = "phi3:mini",
+                           base_url: str = "http://127.0.0.1:11434") -> str:
+    payload = {
+        "model": model,
+        "prompt": f"Be concise and fast.\n\nUser: {prompt}\nAssistant:",
+        "stream": False
+    }
+    with httpx.Client(timeout=30.0) as client:
+        r = client.post(f"{base_url}/api/generate", json=payload)
+        r.raise_for_status()
+        j = r.json()
+        return (j.get("response") or "").strip()
 
-def summarize_text(input_text: str) -> str:
-    """
-    Summarize input text using a lightweight LLM.
-    Args:
-        input_text (str): The input transcript or text.
-    Returns:
-        str: A summary string.
-    """
-    # 2. Run summarization
-    summary = summarizer(input_text, max_length=50, min_length=20, do_sample=False)
-    
-    # 3. Extract summary string
-    return summary[0]['summary_text']
-
-
-# Example usage:
 if __name__ == "__main__":
-    input_string = """
-    In this video, the speaker talks about the importance of learning Python for data science.
-    He explains how libraries like pandas and NumPy make data manipulation easier.
-    He also touches on visualization tools like Matplotlib and Seaborn,
-    and concludes by encouraging viewers to practice coding daily to build confidence.
-    """
-    
-    output_string = summarize_text(input_string)
-    print("===== Summary =====")
-    print(output_string)
+    print(prompt_ollama_generate("What is the capital of Greece?"))
 
-print(sd.query_devices())  # List all input/output devices
-print("Default input:", sd.default.device)
 
