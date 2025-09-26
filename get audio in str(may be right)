@@ -1,0 +1,41 @@
+import sounddevice as sd
+import threading
+import queue
+
+# 参数
+samplerate = 44100  # 采样率
+channels = 2        # 立体声
+device_index = None  # None 默认设备，或者指定 loopback/stereo mix
+chunk_size = 1024   # 每次回调采样数
+
+# 用 queue 存储持续产生的音频数据
+audio_queue = queue.Queue()
+
+def callback(indata, frames, time, status):
+    if status:
+        print(status)
+    # 将音频数据转换为 bytes 并放入队列
+    audio_queue.put(indata.tobytes())
+
+# 启动输入流
+stream = sd.InputStream(samplerate=samplerate,
+                        channels=channels,
+                        dtype='int16',
+                        blocksize=chunk_size,
+                        device=device_index,
+                        callback=callback)
+stream.start()
+
+print("Recording... Press Ctrl+C to stop")
+
+try:
+    while True:
+        # 从队列获取数据（如果有）
+        if not audio_queue.empty():
+            audio_bytes = audio_queue.get()
+            # 这里的 audio_bytes 就是你的“流”，可以直接处理
+            print(f"Got {len(audio_bytes)} bytes of audio")
+except KeyboardInterrupt:
+    print("Stopping...")
+    stream.stop()
+    stream.close()
