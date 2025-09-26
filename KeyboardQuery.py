@@ -10,12 +10,12 @@ Key-to-Value Mapper with Toggle (pynput)
 from typing import Dict, Optional
 from pynput import keyboard
 
-def placeholder_function(value: str) -> None:
+def placeholder_function(value: str) -> str:
     """Placeholder for your action. Replace with your real function later."""
     # TODO: implement your actual action here
     print(f"(Function would run here with: {value})")
 
-def listen_for_key(D: Dict[str, str]) -> None:
+def listen_for_key(D: Dict[str, str]) -> str:
     """
     Start a global key listener that:
       - Acts only on key release.
@@ -55,7 +55,7 @@ def listen_for_key(D: Dict[str, str]) -> None:
                     if len(k) == 1 and k in D:
                         value = D[k]
                         print(f"Key '{k}' → Value: {value}")
-                        placeholder_function(value)
+                        return placeholder_function(value) + value
 
         except Exception as e:
             # Keep listener alive even if something goes wrong
