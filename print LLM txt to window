@@ -16,7 +16,7 @@ def show_text_window(file_path):
     if popup_window is None or not popup_window.winfo_exists():
         # 弹窗不存在，新建窗口
         popup_window = tk.Tk()  # 主窗口直接作为弹窗
-        popup_window.title("文本弹窗")
+        popup_window.title("LLM Output")
         popup_window.geometry("600x400")
         
         # 创建带滚动条的文本框
