@@ -1,4 +1,10 @@
 """
+
+python -m pip install -U pip setuptools wheel
+python -m pip install "ctranslate2<5" faster-whisper
+
+
+
 System OUTPUT audio -> 30s rolling buffer -> on-demand Whisper transcription.
 
 This version explicitly captures the computer's *output* audio by auto-selecting a
