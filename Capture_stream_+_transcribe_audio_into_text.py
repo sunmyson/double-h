@@ -1,34 +1,112 @@
 """
-Rolling system-audio capture -> on-demand 30s snapshot -> Whisper transcription.
+System OUTPUT audio -> 30s rolling buffer -> on-demand Whisper transcription.
 
-- Captures at 16 kHz mono directly, so we avoid resampling and stereo downmix later.
-- Keeps a 30s ring buffer in RAM.
-- On trigger, freezes the last 30s, writes WAV bytes to a temp file, runs faster-whisper, returns text.
+This version explicitly captures the computer's *output* audio by auto-selecting a
+loopback/virtual device per OS (BlackHole on macOS, WASAPI loopback on Windows,
+'monitor' sources on Linux).
 
-Dependencies:
+Install:
   pip install sounddevice numpy faster-whisper
+Also:
+  macOS: install BlackHole (existential.audio), set Multi-Output (speakers+BlackHole)
+  Windows: none (WASAPI loopback exposed automatically)
+  Linux: use PulseAudio/PipeWire 'monitor' sources (pavucontrol helps)
 """
 
 import io
+import sys
 import wave
 import threading
+import tempfile
+from typing import Optional, Tuple
+
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
-import tempfile
-from typing import Optional
 
 # ------------------ Config ------------------
 
-TARGET_SR = 16_000     # Whisper-friendly sample rate
-CHANNELS  = 1          # mono is fine for speech, and lighter
-BUFFER_SEC = 30        # rolling window duration
-BLOCKSIZE = 1024       # audio callback frames
+TARGET_SR  = 16_000   # Whisper-friendly
+CHANNELS   = 1        # capture mono (downmix in callback if needed)
+BUFFER_SEC = 30
+BLOCKSIZE  = 1024
 
-# If you need a specific input device (e.g., BlackHole), set it here:
-#   sd.default.device = (input_device_index, None)
-# Print devices with: print(sd.query_devices())
-# sd.default.device = (None, None)
+# ------------------ Device selection ------------------
+
+def find_system_output_input_device(preferred_name: Optional[str] = None) -> Tuple[int, int]:
+    """
+    Return (input_device_index, max_input_channels) for a loopback/virtual device
+    that captures system OUTPUT audio.
+
+    - macOS: searches for 'BlackHole'/'Loopback'/'Soundflower'
+    - Windows: searches for '(loopback)' devices (WASAPI)
+    - Linux:  searches for 'monitor' devices (PulseAudio/PipeWire)
+    - If preferred_name is given, match that first (case-insensitive substring)
+    """
+    devs = sd.query_devices()
+    name_key = "name"
+
+    # Helper for case-insensitive substring match on device name
+    def matches(i: int, needle: str) -> bool:
+        try:
+            return needle.lower() in devs[i][name_key].lower()
+        except Exception:
+            return False
+
+    # 1) Preferred name (if provided)
+    if preferred_name:
+        for i, d in enumerate(devs):
+            if d["max_input_channels"] > 0 and matches(i, preferred_name):
+                return i, d["max_input_channels"]
+
+    # 2) OS-specific heuristics
+    plat = sys.platform
+    candidates = []
+
+    if plat == "darwin":  # macOS
+        for i, d in enumerate(devs):
+            if d["max_input_channels"] > 0 and (
+                matches(i, "BlackHole") or matches(i, "Loopback") or matches(i, "Soundflower")
+            ):
+                candidates.append((i, d["max_input_channels"]))
+
+    elif plat.startswith("win"):  # Windows (WASAPI loopback exposes "(loopback)")
+        for i, d in enumerate(devs):
+            if d["max_input_channels"] > 0 and matches(i, "(loopback)"):
+                candidates.append((i, d["max_input_channels"]))
+
+    else:  # Linux (PulseAudio/PipeWire monitor sources)
+        for i, d in enumerate(devs):
+            if d["max_input_channels"] > 0 and matches(i, "monitor"):
+                candidates.append((i, d["max_input_channels"]))
+
+    if candidates:
+        return candidates[0]
+
+    # If we got here, we didn't find a loopback device.
+    msg = [
+        "Could not find a system-output capture (loopback) device.",
+        "Fixes:",
+    ]
+    if plat == "darwin":
+        msg += [
+            "- Install BlackHole: https://existential.audio/blackhole/",
+            "- In System Settings → Sound:",
+            "    • Output: Multi-Output (Your speakers + BlackHole)",
+            "    • Input: BlackHole",
+            "- Then re-run. (Or pass preferred_name='BlackHole' here.)",
+        ]
+    elif plat.startswith("win"):
+        msg += [
+            "- Ensure WASAPI loopback devices are enabled.",
+            "- Try selecting a device with '(loopback)' in its name from sd.query_devices().",
+        ]
+    else:
+        msg += [
+            "- Use PulseAudio/PipeWire 'monitor' sources (install pavucontrol).",
+            "- Select the output's monitor as input.",
+        ]
+    raise RuntimeError("\n".join(msg))
 
 # ------------------ Ring buffer ------------------
 
@@ -42,7 +120,6 @@ class AudioRing:
         self.lock = threading.Lock()
 
     def write(self, mono_f32: np.ndarray):
-        """Append a 1-D float32 array (mono) into the ring."""
         n = mono_f32.shape[0]
         with self.lock:
             end = self.idx + n
@@ -55,35 +132,27 @@ class AudioRing:
             self.idx = (self.idx + n) % self.samples
 
     def snapshot(self) -> np.ndarray:
-        """Return a copy of the last `seconds` worth of samples in time order."""
         with self.lock:
             i = self.idx
             return np.concatenate([self.buf[i:], self.buf[:i]]).copy()
 
 # ------------------ Capture ------------------
 
-class SystemAudioCapture:
+class SystemOutputCapture:
     """
-    Starts a sounddevice InputStream capturing at TARGET_SR mono.
-    Writes into a ring buffer.
-
-    macOS: set the input device to BlackHole (or equivalent).
-    Windows: select WASAPI loopback device (sd.query_devices()).
+    Captures *system output* audio by opening an InputStream on a loopback/virtual device.
+    Captures at TARGET_SR; downmixes to mono in the callback.
     """
-
-    def __init__(self, ring: AudioRing, sr: int = TARGET_SR, blocksize: int = BLOCKSIZE, channels: int = CHANNELS):
+    def __init__(self, ring: AudioRing, device_name: Optional[str] = None):
         self.ring = ring
-        self.sr = sr
-        self.channels = channels
-        self.blocksize = blocksize
         self.stream: Optional[sd.InputStream] = None
+        self.device_index, self.max_in = find_system_output_input_device(device_name)
 
     def _cb(self, indata, frames, time_info, status):
         if status:
-            # Non-fatal, but good to see dropouts etc.
             print(status)
-        # indata shape: (frames, channels) float32
-        if self.channels == 1:
+        # indata: (frames, nch)
+        if indata.shape[1] == 1:
             mono = indata[:, 0].astype(np.float32)
         else:
             mono = np.mean(indata, axis=1).astype(np.float32)
@@ -91,10 +160,11 @@ class SystemAudioCapture:
 
     def start(self):
         self.stream = sd.InputStream(
-            samplerate=self.sr,
-            channels=self.channels,
+            samplerate=TARGET_SR,
+            channels=min(self.max_in, 2),   # handle mono/2ch devices
             dtype="float32",
-            blocksize=self.blocksize,
+            blocksize=BLOCKSIZE,
+            device=self.device_index,
             callback=self._cb,
         )
         self.stream.start()
@@ -105,12 +175,9 @@ class SystemAudioCapture:
             self.stream.close()
             self.stream = None
 
-# ------------------ Snapshot -> WAV bytes ------------------
+# ------------------ WAV bytes helper ------------------
 
 def float32_to_wav_bytes(mono_f32: np.ndarray, sr: int = TARGET_SR) -> bytes:
-    """
-    Convert float32 mono [-1, 1] to 16-bit PCM WAV bytes (in-memory).
-    """
     pcm = np.clip(mono_f32, -1.0, 1.0)
     pcm16 = (pcm * 32767.0).astype(np.int16)
     buff = io.BytesIO()
@@ -121,54 +188,40 @@ def float32_to_wav_bytes(mono_f32: np.ndarray, sr: int = TARGET_SR) -> bytes:
         wf.writeframes(pcm16.tobytes())
     return buff.getvalue()
 
-# ------------------ Whisper transcription ------------------
+# ------------------ Whisper wrapper ------------------
 
 class LocalWhisper:
-    """
-    Tiny, fast Whisper wrapper for <=30s clips.
-    Loads once; reuses model for all triggers.
-    """
     def __init__(self, model_size: str = "tiny", compute_type: str = "int8"):
-        # CPU-friendly defaults
         self.model = WhisperModel(model_size, device="cpu", compute_type=compute_type)
 
     def transcribe_wav_bytes(self, wav_bytes: bytes) -> str:
-        # faster-whisper wants a file path; write to a temp file briefly.
         with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
             tmp.write(wav_bytes)
             tmp.flush()
             segments, _ = self.model.transcribe(tmp.name, beam_size=1)
         return " ".join(seg.text.strip() for seg in segments)
 
-# ------------------ Wiring it together ------------------
+# ------------------ Wire it up ------------------
 
-# 1) Create ring + capture and start it
 ring = AudioRing(seconds=BUFFER_SEC, sr=TARGET_SR)
-cap = SystemAudioCapture(ring, sr=TARGET_SR, channels=CHANNELS)
+cap  = SystemOutputCapture(ring, device_name=None)  # or e.g., 'BlackHole'
 cap.start()
-print(f"Capturing system audio → {BUFFER_SEC}s ring @ {TARGET_SR} Hz mono. (Ctrl+C to stop)")
+print(f"[OK] Capturing *system output* → {BUFFER_SEC}s ring @ {TARGET_SR} Hz mono. (Ctrl+C to stop)")
 
-# 2) Create a Whisper engine once (reuse across triggers)
 whisper_engine = LocalWhisper(model_size="tiny", compute_type="int8")
 
-def on_trigger_transcribe_last_30s() -> str:
-    """
-    Freeze the last 30s, encode to WAV (in memory), run Whisper, return text.
-    Call this from your hotkey handler or button click.
-    """
+def transcribe_last_30s() -> str:
     mono = ring.snapshot()
     wav_bytes = float32_to_wav_bytes(mono, sr=TARGET_SR)
-    text = whisper_engine.transcribe_wav_bytes(wav_bytes)
-    return text
+    return whisper_engine.transcribe_wav_bytes(wav_bytes)
 
-# Example: simple REPL trigger (press Enter to transcribe the last 30s)
+# Simple demo loop
 if __name__ == "__main__":
     try:
         while True:
-            input("Press Enter to transcribe the last 30 seconds...")
-            transcript = on_trigger_transcribe_last_30s()
+            input("Press Enter to transcribe the last 30 seconds of SYSTEM audio...")
             print("\n--- Transcript ---")
-            print(transcript or "(no speech detected)")
+            print(transcribe_last_30s() or "(no speech detected)")
             print("------------------\n")
     except KeyboardInterrupt:
         print("Stopping capture...")
