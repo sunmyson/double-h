@@ -19,6 +19,11 @@ Also:
   Linux: use PulseAudio/PipeWire 'monitor' sources (pavucontrol helps)
 """
 
+import sounddevice as sd
+from pprint import pprint
+
+
+
 import io
 import sys
 import wave
@@ -28,6 +33,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
+
 from faster_whisper import WhisperModel
 
 # ------------------ Config ------------------
