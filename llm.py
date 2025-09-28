@@ -1,20 +1,75 @@
+"""Remote LLM client using Groq's free API tier.
+
+Set the ``GROQ_API_KEY`` environment variable with your personal token before
+calling :func:`prompt_llm`.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Optional
+
 import httpx
 
-def prompt_ollama_generate(prompt: str,
-                           model: str = "phi3:mini",
-                           base_url: str = "http://127.0.0.1:11434") -> str:
+DEFAULT_MODEL = "mixtral-8x7b-32768"
+API_URL = "https://api.groq.com/openai/v1/chat/completions"
+SYSTEM_PROMPT = "You are a fast, precise assistant. Keep replies short and clear."
+
+
+class LLMError(RuntimeError):
+    """Raised when the remote LLM client cannot complete a request."""
+
+
+def prompt_llm(prompt: str, *, model: str = DEFAULT_MODEL, api_key: Optional[str] = None) -> str:
+    """Return a completion from Groq's hosted models.
+
+    Args:
+        prompt: User content to send to the model.
+        model: Groq model identifier. Defaults to ``mixtral-8x7b-32768`` (free tier).
+        api_key: Optional explicit API key. Falls back to ``GROQ_API_KEY`` env var.
+    """
+    token = api_key or os.getenv("GROQ_API_KEY")
+    if not token:
+        raise LLMError(
+            "Missing GROQ_API_KEY environment variable. Create a free API token at "
+            "https://console.groq.com/, then export it before running the app."
+        )
+
     payload = {
         "model": model,
-        "prompt": f"Be concise and fast.\n\nUser: {prompt}\nAssistant:",
-        "stream": False
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 512,
+        "stream": False,
     }
-    with httpx.Client(timeout=30.0) as client:
-        r = client.post(f"{base_url}/api/generate", json=payload)
-        r.raise_for_status()
-        j = r.json()
-        return (j.get("response") or "").strip()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
 
-if __name__ == "__main__":
-    print(prompt_ollama_generate("What is the capital of Greece?"))
+    try:
+        with httpx.Client(timeout=45.0) as client:
+            response = client.post(API_URL, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPStatusError as exc:
+        raise LLMError(f"Groq API returned HTTP {exc.response.status_code}: {exc.response.text}") from exc
+    except httpx.HTTPError as exc:
+        raise LLMError(f"Groq API request failed: {exc}") from exc
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise LLMError("Groq API returned no completion choices.")
+
+    message = choices[0].get("message", {}).get("content")
+    if not message:
+        raise LLMError("Groq API completion had empty content.")
+
+    return message.strip()
 
 
+if __name__ == "__main__":  # pragma: no cover - manual check
+    print(prompt_llm("What is the capital of Greece?"))
